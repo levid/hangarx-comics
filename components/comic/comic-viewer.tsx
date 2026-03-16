@@ -17,7 +17,17 @@ import {
   PlayCircle,
   PauseCircle,
   Keyboard,
-  Library
+  Library,
+  Bookmark,
+  BookmarkCheck,
+  Share2,
+  Sun,
+  Volume2,
+  VolumeX,
+  ArrowLeftRight,
+  ScrollText,
+  Copy,
+  Check
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -38,6 +48,9 @@ import {
 import { ComicPage } from './comic-page'
 import { useSwipe } from '@/hooks/use-swipe'
 import { useGsapAnimations } from '@/hooks/use-gsap-animations'
+import { useReadingProgress } from '@/hooks/use-reading-progress'
+import { usePagePreloader } from '@/hooks/use-page-preloader'
+import { useBookmarks } from '@/hooks/use-bookmarks'
 import type { ComicPage as ComicPageType } from '@/lib/comic-data'
 import { cn } from '@/lib/utils'
 
@@ -71,15 +84,21 @@ const STATIC_PAGE_DURATION = 4000
 const CHROME_HIDE_DELAY = 3000
 
 export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEpisode = 'ep2' }: ComicViewerProps) {
+  // Read URL params on mount for deep linking
+  const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null
+  const urlVol = urlParams?.get('vol') || initialVolume
+  const urlEp = urlParams?.get('ep') || initialEpisode
+  const urlPage = urlParams?.get('page') ? parseInt(urlParams.get('page')!, 10) - 1 : null // 1-indexed in URL
+
   // Active volume/episode (state-driven for in-viewer navigation)
-  const [activeVolume, setActiveVolume] = useState(initialVolume)
-  const [activeEpisode, setActiveEpisode] = useState(initialEpisode)
+  const [activeVolume, setActiveVolume] = useState(urlVol)
+  const [activeEpisode, setActiveEpisode] = useState(urlEp)
   // Volume/episode listing for the dropdown
   const [volumeList, setVolumeList] = useState<VolumeInfo[]>([])
   // Which volumes are expanded in the tree view
-  const [expandedVolumes, setExpandedVolumes] = useState<Set<string>>(() => new Set([initialVolume]))
+  const [expandedVolumes, setExpandedVolumes] = useState<Set<string>>(() => new Set([urlVol]))
   // Which episodes are expanded in the tree view (keyed as "vol:ep")
-  const [expandedEpisodes, setExpandedEpisodes] = useState<Set<string>>(() => new Set([`${initialVolume}:${initialEpisode}`]))
+  const [expandedEpisodes, setExpandedEpisodes] = useState<Set<string>>(() => new Set([`${urlVol}:${urlEp}`]))
 
   // currentPage is a page INDEX (0-based) — always advances by 1
   const [currentPage, setCurrentPage] = useState(0)
@@ -99,15 +118,29 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
   const [autoPlaySlot, setAutoPlaySlot] = useState(0)
   const [forceSinglePage, setForceSinglePage] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
-  const [hoveredSegment, setHoveredSegment] = useState<number | null>(null)
   const [toastMessage, setToastMessage] = useState<string | null>(null)
+  const [scrollMode, setScrollMode] = useState(false)
+  const [readingDirection, setReadingDirection] = useState<'ltr' | 'rtl'>('ltr')
+  const [brightness, setBrightness] = useState(1)
+  const [globalMute, setGlobalMute] = useState(false)
+  const [showBookmarksPanel, setShowBookmarksPanel] = useState(false)
+  const [hoveredSegment, setHoveredSegment] = useState<number | null>(null)
+  const [showShareDialog, setShowShareDialog] = useState(false)
+  const [shareLinkCopied, setShareLinkCopied] = useState(false)
   const toastRef = useRef<HTMLDivElement>(null)
   const toastTimerRef = useRef<NodeJS.Timeout | null>(null)
   const staticAnimFrameRef = useRef<number | null>(null)
   const thumbnailScrollRef = useRef<HTMLDivElement>(null)
   const glowRef = useRef<HTMLDivElement>(null)
   const pageCounterRef = useRef<HTMLSpanElement>(null)
-  const headerRef = useRef<HTMLElement>(null)
+  const pageContainerRef = useRef<HTMLDivElement>(null)
+  const lastTouchDistRef = useRef<number | null>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const pendingPageRef = useRef<number | null>(urlPage)
+
+  // Hooks
+  const { saveProgress, getProgress } = useReadingProgress()
+  const { toggleBookmark, isBookmarked, getBookmarks } = useBookmarks()
 
   // GSAP animation hook
   const {
@@ -144,15 +177,28 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
   const [chromeVisible, setChromeVisible] = useState(true)
   const chromeTimerRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Pinch-to-zoom
   const [zoomScale, setZoomScale] = useState(1)
   const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 })
-  const pageContainerRef = useRef<HTMLDivElement>(null)
-  const lastTouchDistRef = useRef<number | null>(null)
 
   // Handle clicking a page to toggle its audio
   const handlePageAudioFocus = useCallback((pageId: number) => {
     setAudioFocusPageId(prev => prev === pageId ? null : pageId)
+  }, [])
+
+  // Read URL deep-link params
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const vol = params.get('vol')
+    const ep = params.get('ep')
+    const page = params.get('page')
+    if (vol) setActiveVolume(vol)
+    if (ep) setActiveEpisode(ep)
+    if (vol) setExpandedVolumes(new Set([vol]))
+    if (vol && ep) setExpandedEpisodes(new Set([`${vol}:${ep}`]))
+    if (page) {
+      const pageNum = parseInt(page, 10)
+      if (!isNaN(pageNum) && pageNum >= 0) setCurrentPage(pageNum)
+    }
   }, [])
 
   // Fetch volume/episode listing
@@ -174,11 +220,34 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       })
       .then((data: ComicManifest) => {
         setManifest(data)
-        setCurrentPage(0)
+        // Check for pending page navigation (from dropdown)
+        if (pendingPageRef.current !== null && pendingPageRef.current < data.pages.length) {
+          setCurrentPage(pendingPageRef.current)
+          pendingPageRef.current = null
+        } else {
+          // Restore reading progress or start at 0
+          const savedPage = getProgress(activeVolume, activeEpisode)
+          if (savedPage !== null && savedPage > 0 && savedPage < data.pages.length) {
+            setCurrentPage(savedPage)
+            setTimeout(() => showToast(`Resumed at page ${savedPage + 1}`), 500)
+          } else {
+            setCurrentPage(0)
+          }
+        }
       })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [activeVolume, activeEpisode])
+  }, [activeVolume, activeEpisode, getProgress, showToast])
+
+  // Sync URL with current reading position for shareable links
+  useEffect(() => {
+    const params = new URLSearchParams()
+    params.set('vol', activeVolume)
+    params.set('ep', activeEpisode)
+    params.set('page', String(currentPage + 1)) // 1-indexed for humans
+    const newUrl = `${window.location.pathname}?${params.toString()}`
+    window.history.replaceState(null, '', newUrl)
+  }, [activeVolume, activeEpisode, currentPage])
 
   // Check if mobile
   useEffect(() => {
@@ -241,13 +310,21 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       setAutoPlaySlot(0)
       setZoomScale(1)
       setCurrentPage(nextPage)
-      animatePageTransition(pageContainerRef.current, 'left')
+      animatePageTransition(pageContainerRef.current, readingDirection === 'rtl' ? 'right' : 'left')
       animateGlowTransition(glowRef.current)
       animatePageNumber(pageCounterRef.current)
+      if (scrollMode && scrollContainerRef.current) {
+        const container = scrollContainerRef.current
+        const child = container.children[nextPage] as HTMLElement
+        if (child) {
+          gsap.killTweensOf(container)
+          gsap.to(container, { scrollTop: child.offsetTop, duration: 0.8, ease: 'power2.inOut' })
+        }
+      }
     } else if (isAutoPlay) {
       setIsAutoPlay(false)
     }
-  }, [currentPage, maxPage, isAutoPlay, pagesPerView, animatePageTransition, animateGlowTransition, animatePageNumber])
+  }, [currentPage, maxPage, isAutoPlay, pagesPerView, readingDirection, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   const goToPrevPage = useCallback(() => {
     if (currentPage > 0) {
@@ -256,24 +333,33 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       setAutoPlaySlot(0)
       setZoomScale(1)
       setCurrentPage(prev => Math.max(prev - step, 0))
-      animatePageTransition(pageContainerRef.current, 'right')
+      animatePageTransition(pageContainerRef.current, readingDirection === 'rtl' ? 'left' : 'right')
       animateGlowTransition(glowRef.current)
       animatePageNumber(pageCounterRef.current)
     }
-  }, [currentPage, pagesPerView, animatePageTransition, animateGlowTransition, animatePageNumber])
+  }, [currentPage, pagesPerView, readingDirection, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   const goToPage = useCallback((pageIndex: number) => {
     const targetPage = Math.max(0, Math.min(pageIndex, maxPage))
-    const direction = targetPage > currentPage ? 'left' : 'right'
     setCurrentPage(targetPage)
     setVideoEndedCount(0)
     setAutoPlaySlot(0)
     setShowThumbnailPanel(false)
     setZoomScale(1)
-    animatePageTransition(pageContainerRef.current, direction)
-    animateGlowTransition(glowRef.current)
-    animatePageNumber(pageCounterRef.current)
-  }, [maxPage, currentPage, animatePageTransition, animateGlowTransition, animatePageNumber])
+    if (scrollMode && scrollContainerRef.current) {
+      const container = scrollContainerRef.current
+      const child = container.children[targetPage] as HTMLElement
+      if (child) {
+        gsap.killTweensOf(container)
+        gsap.to(container, { scrollTop: child.offsetTop, duration: 0.8, ease: 'power2.inOut' })
+      }
+    } else {
+      const direction = targetPage > currentPage ? 'left' : 'right'
+      animatePageTransition(pageContainerRef.current, direction)
+      animateGlowTransition(glowRef.current)
+      animatePageNumber(pageCounterRef.current)
+    }
+  }, [maxPage, currentPage, scrollMode, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   // --- Tap zones ---
   const handleTapZone = useCallback((e: React.MouseEvent<HTMLElement>) => {
@@ -358,7 +444,29 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
   // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      resetChromeTimer()
+      if (scrollMode && scrollContainerRef.current) {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+          e.preventDefault()
+          const container = scrollContainerRef.current
+          const nextIdx = Math.min(currentPage + 1, pages.length - 1)
+          const child = container.children[nextIdx] as HTMLElement
+          if (child) {
+            gsap.killTweensOf(container)
+            gsap.to(container, { scrollTop: child.offsetTop, duration: 0.8, ease: 'power2.inOut' })
+          }
+          return
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+          e.preventDefault()
+          const container = scrollContainerRef.current
+          const prevIdx = Math.max(currentPage - 1, 0)
+          const child = container.children[prevIdx] as HTMLElement
+          if (child) {
+            gsap.killTweensOf(container)
+            gsap.to(container, { scrollTop: child.offsetTop, duration: 0.8, ease: 'power2.inOut' })
+          }
+          return
+        }
+      }
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
         goToNextPage()
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
@@ -369,24 +477,60 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
         setZoomScale(1)
       } else if (e.key === 'f') {
         setIsFullscreen(prev => {
-          if (!prev) setChromeVisible(false) // entering fullscreen — hide chrome
-          else resetChromeTimer() // exiting — show chrome briefly
+          if (!prev) setChromeVisible(false)
+          else resetChromeTimer()
           return !prev
         })
       } else if (e.key === 'v') {
-        setIsVideoMode(prev => !prev)
+        setIsVideoMode(prev => {
+          showToast(!prev ? 'Motion mode' : 'Static mode')
+          return !prev
+        })
       } else if (e.key === ' ') {
         e.preventDefault()
-        setIsAutoPlay(prev => !prev)
+        setIsAutoPlay(prev => {
+          showToast(!prev ? 'Autoplay enabled' : 'Autoplay paused')
+          return !prev
+        })
       } else if (e.key === 't') {
         setShowThumbnailPanel(prev => !prev)
       } else if (e.key === '?') {
         setShowShortcuts(prev => !prev)
+      } else if (e.key === 'z') {
+        setZoomScale(prev => {
+          if (prev === 1) { showToast('Fit to width'); return 1.5 }
+          showToast('Fit to page'); return 1
+        })
+      } else if (e.key === 'b') {
+        toggleBookmark(activeVolume, activeEpisode, currentPage)
+        showToast(isBookmarked(activeVolume, activeEpisode, currentPage) ? 'Bookmark removed' : 'Page bookmarked')
+      } else if (e.key === 's') {
+        setScrollMode(prev => {
+          showToast(!prev ? 'Scroll mode' : 'Page mode')
+          return !prev
+        })
+      } else if (e.key === 'd') {
+        setReadingDirection(prev => {
+          const next = prev === 'ltr' ? 'rtl' : 'ltr'
+          showToast(next === 'rtl' ? 'Right-to-left' : 'Left-to-right')
+          return next
+        })
+      } else if (e.key === 'm') {
+        setGlobalMute(prev => {
+          if (!prev) {
+            setAudioFocusPageId(null)
+          } else {
+            const page = pages[currentPage]
+            if (page) setAudioFocusPageId(page.id)
+          }
+          showToast(!prev ? 'Muted' : 'Unmuted')
+          return !prev
+        })
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [goToNextPage, goToPrevPage, resetChromeTimer])
+  }, [goToNextPage, goToPrevPage, resetChromeTimer, showToast, toggleBookmark, isBookmarked, activeVolume, activeEpisode, currentPage])
 
   // Current visible pages
   const currentPages = useMemo(() => {
@@ -484,15 +628,29 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
     setAutoPlaySlot(0)
   }, [currentPage])
 
-  // Auto-unmute: audio follows the active auto-play slot
+  // Scroll to current page when entering scroll mode
   useEffect(() => {
-    if (isAutoPlay && isVideoMode) {
-      const slotPage = pages[currentPage + autoPlaySlot]
-      if (slotPage?.video) {
-        setAudioFocusPageId(slotPage.id)
+    if (scrollMode && scrollContainerRef.current) {
+      requestAnimationFrame(() => {
+        const container = scrollContainerRef.current
+        if (container) {
+          const child = container.children[currentPage] as HTMLElement
+          if (child) container.scrollTop = child.offsetTop
+        }
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollMode])
+
+  // Auto-unmute: in motion mode, audio follows the current page
+  useEffect(() => {
+    if (isVideoMode) {
+      const targetPage = isAutoPlay ? pages[currentPage + autoPlaySlot] : pages[currentPage]
+      if (targetPage?.video) {
+        setAudioFocusPageId(targetPage.id)
       }
     }
-  }, [isAutoPlay, isVideoMode, currentPage, autoPlaySlot, pages])
+  }, [isVideoMode, isAutoPlay, currentPage, autoPlaySlot, pages])
 
   // Animate static page progress during auto-play
   useEffect(() => {
@@ -538,14 +696,27 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
     }
   }, [showThumbnailPanel, animateThumbnailPanel])
 
-  // Loading state
+  // Page preloader
+  usePagePreloader(pages, currentPage)
+
+  // Save reading progress on page change
+  useEffect(() => {
+    if (pages.length > 0 && currentPage > 0) {
+      saveProgress(activeVolume, activeEpisode, currentPage)
+    }
+  }, [currentPage, activeVolume, activeEpisode, pages.length, saveProgress])
+
+
+
+  // Loading skeleton
   if (loading) {
     return (
       <div className="flex items-center justify-center w-full h-screen bg-black">
-        <div className="flex flex-col items-center gap-4">
-          <Loader2 className="w-8 h-8 animate-spin text-primary" />
-          <p className="text-muted-foreground text-sm">Loading comic…</p>
+        <div className="flex items-center gap-2">
+          <div className="w-[280px] md:w-[400px] aspect-[2/3] rounded-lg bg-white/[0.04] animate-pulse" />
+          <div className="hidden md:block w-[280px] md:w-[400px] aspect-[2/3] rounded-lg bg-white/[0.03] animate-pulse" style={{ animationDelay: '150ms' }} />
         </div>
+        <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-white/[0.04] animate-pulse" />
       </div>
     )
   }
@@ -578,24 +749,27 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
             chromeVisible ? 'py-3 max-h-20 opacity-100' : 'py-0 max-h-0 opacity-0 border-transparent pointer-events-none'
           )}
         >
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-5">
+            {/* HangarX logo */}
+            <a href="https://www.hangarx.ai" target="_blank" rel="noopener noreferrer" title="HangarX">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 118" className="w-6 h-[22px] hover:opacity-70 transition-opacity" fill="white">
+                <g transform="translate(0,118) scale(0.1,-0.1)">
+                  <path d="M270 1052 c0 -4 21 -79 46 -167 70 -244 73 -225 -85 -543 -72 -144 -131 -265 -131 -267 0 -22 53 34 276 288 141 160 259 293 263 295 4 1 123 -130 265 -293 142 -162 264 -295 272 -295 9 0 -35 98 -118 265 -163 328 -160 308 -90 553 29 102 45 172 38 172 -6 0 -89 -88 -184 -195 -95 -107 -176 -195 -181 -195 -4 0 -85 88 -180 195 -157 177 -191 210 -191 187z"/>
+                </g>
+              </svg>
+            </a>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <button className="flex items-center gap-2.5 hover:bg-white/5 rounded-xl px-2.5 py-1.5 -ml-2.5 transition-colors group focus:outline-none">
-                  <Library className="w-5 h-5 text-primary" />
-                  <div className="text-left">
-                    <h1 className="text-sm font-semibold text-foreground tracking-wide uppercase">
-                      {activeVolume.replace('vol', 'Vol ')} — {activeEpisode.replace('ep', 'Ep ')}
-                    </h1>
-                    <p className="text-[10px] text-muted-foreground">
-                      {pages.length} pages
-                    </p>
-                  </div>
+                <button className="flex items-center gap-2 hover:bg-white/5 rounded-xl px-2 py-1.5 -ml-2 transition-colors group focus:outline-none">
+                  <span className="text-sm font-semibold text-foreground tracking-wide uppercase">
+                    {activeVolume.replace('vol', 'Vol ')} — {activeEpisode.replace('ep', 'Ep ')}
+                  </span>
                   <ChevronDown className="w-3.5 h-3.5 text-muted-foreground group-hover:text-foreground transition-colors" />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="start"
+                alignOffset={-24}
                 className="w-64 max-h-[70vh] overflow-y-auto p-1.5 bg-black/85 backdrop-blur-2xl border border-white/[0.08] rounded-xl shadow-2xl shadow-black/50"
               >
                 {volumeList.map((vol, volIdx) => {
@@ -688,8 +862,11 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
                                               if (!isActiveEp) {
                                                 setActiveVolume(vol.id)
                                                 setActiveEpisode(ep.id)
+                                                pendingPageRef.current = i
+                                              } else {
+                                                goToPage(i)
                                               }
-                                              goToPage(i)
+                                              setShowThumbnailPanel(false)
                                             }}
                                             className={cn(
                                               'text-[10px] py-1 rounded text-center transition-all tabular-nums focus:outline-none',
@@ -813,6 +990,103 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
               </div>
             )}
 
+            {/* Global mute toggle */}
+            <button
+              onClick={() => {
+                setGlobalMute(prev => {
+                  if (!prev) {
+                    setAudioFocusPageId(null)
+                  } else {
+                    // Unmuting — restore audio to current page
+                    const page = pages[currentPage]
+                    if (page) setAudioFocusPageId(page.id)
+                  }
+                  showToast(!prev ? 'Muted' : 'Unmuted')
+                  return !prev
+                })
+              }}
+              className={cn(
+                'p-1.5 rounded-md transition-colors',
+                globalMute
+                  ? 'text-red-400 hover:bg-muted'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+              title={globalMute ? 'Unmute all audio' : 'Mute all audio'}
+            >
+              {globalMute ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+            </button>
+
+            {/* Reading direction toggle */}
+            <button
+              onClick={() => {
+                setReadingDirection(prev => {
+                  const next = prev === 'ltr' ? 'rtl' : 'ltr'
+                  showToast(next === 'rtl' ? 'Right-to-left' : 'Left-to-right')
+                  return next
+                })
+              }}
+              className={cn(
+                'p-1.5 rounded-md transition-colors',
+                readingDirection === 'rtl'
+                  ? 'bg-primary/20 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+              title={`Reading direction: ${readingDirection.toUpperCase()} (D)`}
+            >
+              <ArrowLeftRight className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Scroll mode toggle */}
+            <button
+              onClick={() => {
+                setScrollMode(prev => {
+                  showToast(!prev ? 'Scroll mode' : 'Page mode')
+                  return !prev
+                })
+              }}
+              className={cn(
+                'p-1.5 rounded-md transition-colors',
+                scrollMode
+                  ? 'bg-primary/20 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+              title={scrollMode ? 'Switch to page mode (S)' : 'Switch to scroll mode (S)'}
+            >
+              <ScrollText className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Bookmark toggle */}
+            <button
+              onClick={() => {
+                toggleBookmark(activeVolume, activeEpisode, currentPage)
+                showToast(isBookmarked(activeVolume, activeEpisode, currentPage) ? 'Bookmark removed' : 'Page bookmarked')
+              }}
+              className={cn(
+                'p-1.5 rounded-md transition-colors',
+                isBookmarked(activeVolume, activeEpisode, currentPage)
+                  ? 'text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+              title="Bookmark this page (B)"
+            >
+              {isBookmarked(activeVolume, activeEpisode, currentPage)
+                ? <BookmarkCheck className="w-3.5 h-3.5" />
+                : <Bookmark className="w-3.5 h-3.5" />
+              }
+            </button>
+
+            {/* Share link */}
+            <button
+              onClick={() => {
+                setShowShareDialog(true)
+                setShareLinkCopied(false)
+              }}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+              title="Share page link"
+            >
+              <Share2 className="w-3.5 h-3.5" />
+            </button>
+
             {/* Fullscreen toggle */}
             <Button
               variant={isFullscreen ? 'default' : 'outline'}
@@ -885,6 +1159,7 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       {/* Main viewer area — with tap zones */}
       <main
         className="flex-1 relative overflow-hidden select-none"
+        style={{ filter: brightness !== 1 ? `brightness(${brightness})` : undefined }}
         onClick={handleTapZone}
         onDoubleClick={handleDoubleClick}
         onTouchStart={(e) => {
@@ -906,7 +1181,7 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       >
 
         {/* Ambient backlight glow — dynamically matches current page colors */}
-        {pages[currentPage]?.image && (
+        {!scrollMode && pages[currentPage]?.image && (
           <div
             ref={glowRef}
             className="absolute inset-0 flex items-center justify-center pointer-events-none z-0"
@@ -927,64 +1202,112 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
           </div>
         )}
 
-        {/* Book wrapper */}
-        <div className={cn(
-          'absolute flex items-center justify-center z-[1]',
-          isFullscreen ? 'inset-1' : 'inset-2 sm:inset-4 md:inset-8'
-        )}>
-          {/* Page spread container with zoom */}
+        {scrollMode ? (
+          /* Vertical scroll mode — continuous reading */
           <div
-            ref={pageContainerRef}
-            className={cn(
-              'relative flex gap-0.5 sm:gap-1 md:gap-2 h-full max-w-full',
-              isSinglePage ? 'max-h-full' : 'max-h-[85vh]'
-            )}
-            style={{
-              aspectRatio: isSinglePage ? '3/4' : '4/3',
-              perspective: '2000px',
-              transform: zoomScale > 1 ? `scale(${zoomScale})` : undefined,
-              transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%`,
-              transition: zoomScale === 1 ? 'transform 0.3s ease' : undefined
+            ref={scrollContainerRef}
+            className="absolute inset-0 overflow-y-auto"
+            style={{ scrollSnapType: undefined }}
+            onScroll={(e) => {
+              const target = e.currentTarget
+              const scrollTop = target.scrollTop
+              const pageHeight = target.clientHeight
+              const newPage = Math.round(scrollTop / pageHeight)
+              if (newPage !== currentPage && newPage >= 0 && newPage < pages.length) {
+                setCurrentPage(newPage)
+              }
             }}
           >
-            {currentPages.map((page, index) => {
-              const globalIndex = currentPage + index
-              return (
-                <div
-                  key={page.id}
-                  className={cn(
-                    'relative h-full transition-all duration-300',
-                    isSinglePage ? 'w-full' : 'w-1/2'
-                  )}
-                  style={{ transformStyle: 'preserve-3d' }}
-                >
+            {pages.map((page, index) => (
+              <div
+                key={page.id}
+                className="w-full flex items-center justify-center"
+                style={{
+                  minHeight: '100%',
+                  scrollSnapAlign: 'start',
+                }}
+              >
+                <div className="relative w-full max-w-2xl mx-auto" style={{ aspectRatio: '3/4' }}>
                   <ComicPage
                     page={page}
                     isVideoMode={isVideoMode}
-                    isActive={activePageIndices.has(globalIndex)}
-                    shouldPreload={false}
-                    isMuted={audioFocusPageId !== page.id}
+                    isActive={index === currentPage}
+                    shouldPreload={Math.abs(index - currentPage) <= 3}
+                    isMuted={globalMute || audioFocusPageId !== page.id}
                     onAudioFocus={() => handlePageAudioFocus(page.id)}
-                    onVideoEnded={isAutoPlay && index === autoPlaySlot ? handleVideoEnded : undefined}
-                    onVideoProgress={index === autoPlaySlot ? handleVideoProgress : undefined}
                     onToggleMotion={() => setIsVideoMode(false)}
-                    autoPlayActive={isAutoPlay && index === autoPlaySlot}
-                    forceContain={false}
-                    className={cn(
-                      !isSinglePage && index === 0 && 'rounded-r-none',
-                      !isSinglePage && index === 1 && 'rounded-l-none'
-                    )}
+                    autoPlayActive={false}
+                    forceContain={page.id === 0}
+                    className="rounded-none"
                   />
                 </div>
-              )
-            })}
-
-            {/* Book spine effect for two-page spread */}
-            {!isSinglePage && currentPages.length === 2 && (
-              <div className="absolute left-1/2 top-0 bottom-0 w-2 -translate-x-1/2 bg-gradient-to-r from-black/30 via-black/10 to-black/30 z-10 pointer-events-none" />
-            )}
+              </div>
+            ))}
           </div>
-        </div>
+        ) : (
+          /* Paginated mode — default */
+          <>
+            {/* Book wrapper */}
+            <div className={cn(
+              'absolute flex items-center justify-center z-[1]',
+              isFullscreen ? 'inset-1' : 'inset-2 sm:inset-4 md:inset-8'
+            )}>
+              {/* Page spread container with zoom */}
+              <div
+                ref={pageContainerRef}
+                className={cn(
+                  'relative flex gap-0.5 sm:gap-1 md:gap-2 h-full max-w-full',
+                  isSinglePage ? 'max-h-full' : 'max-h-[85vh]'
+                )}
+                style={{
+                  aspectRatio: isSinglePage ? '3/4' : '4/3',
+                  perspective: '2000px',
+                  direction: readingDirection,
+                  transform: zoomScale > 1 ? `scale(${zoomScale})` : undefined,
+                  transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%`,
+                  transition: zoomScale === 1 ? 'transform 0.3s ease' : undefined
+                }}
+              >
+                {currentPages.map((page, index) => {
+                  const globalIndex = currentPage + index
+                  return (
+                    <div
+                      key={page.id}
+                      className={cn(
+                        'relative h-full transition-all duration-300',
+                        isSinglePage ? 'w-full' : 'w-1/2'
+                      )}
+                      style={{ transformStyle: 'preserve-3d' }}
+                    >
+                      <ComicPage
+                        page={page}
+                        isVideoMode={isVideoMode}
+                        isActive={activePageIndices.has(globalIndex)}
+                        shouldPreload={false}
+                        isMuted={globalMute || audioFocusPageId !== page.id}
+                        onAudioFocus={() => handlePageAudioFocus(page.id)}
+                        onVideoEnded={isAutoPlay && index === autoPlaySlot ? handleVideoEnded : undefined}
+                        onVideoProgress={index === autoPlaySlot ? handleVideoProgress : undefined}
+                        onToggleMotion={() => setIsVideoMode(false)}
+                        autoPlayActive={isAutoPlay && index === autoPlaySlot}
+                        forceContain={isCoverPage}
+                        className={cn(
+                          !isSinglePage && index === 0 && 'rounded-r-none',
+                          !isSinglePage && index === 1 && 'rounded-l-none'
+                        )}
+                      />
+                    </div>
+                  )
+                })}
+
+                {/* Book spine effect for two-page spread */}
+                {!isSinglePage && currentPages.length === 2 && (
+                  <div className="absolute left-1/2 top-0 bottom-0 w-2 -translate-x-1/2 bg-gradient-to-r from-black/30 via-black/10 to-black/30 z-10 pointer-events-none" />
+                )}
+              </div>
+            </div>
+          </>
+        )}
 
         {/* Preload adjacent pages (hidden) */}
         <div className="hidden">
@@ -1004,38 +1327,55 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
           })}
         </div>
 
-        {/* Navigation arrows — auto-hide with chrome */}
-        <button
-          onClick={(e) => { e.stopPropagation(); goToPrevPage() }}
-          disabled={currentPage === 0}
-          className={cn(
-            'absolute left-2 md:left-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
-            'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
-            'text-foreground hover:bg-card hover:scale-110 transition-all',
-            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
-            chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
-            'transition-opacity duration-500'
-          )}
-          aria-label="Previous page"
-        >
-          <ChevronLeft className="w-5 h-5 md:w-6 md:h-6" />
-        </button>
+        {/* Navigation arrows — auto-hide with chrome, hidden in scroll mode */}
+        {!scrollMode && (
+          <>
+            <button
+              onClick={(e) => { e.stopPropagation(); goToPrevPage() }}
+              disabled={currentPage === 0}
+              className={cn(
+                'absolute left-2 md:left-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
+                'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
+                'text-foreground hover:bg-card hover:scale-110 transition-all',
+                'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
+                chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
+                'transition-opacity duration-500'
+              )}
+              aria-label="Previous page"
+            >
+              <ChevronLeft className="w-5 h-5 md:w-6 md:h-6" />
+            </button>
 
-        <button
-          onClick={(e) => { e.stopPropagation(); goToNextPage() }}
-          disabled={currentPage >= maxPage}
-          className={cn(
-            'absolute right-2 md:right-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
-            'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
-            'text-foreground hover:bg-card hover:scale-110 transition-all',
-            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
-            chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
-            'transition-opacity duration-500'
-          )}
-          aria-label="Next page"
-        >
-          <ChevronRight className="w-5 h-5 md:w-6 md:h-6" />
-        </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); goToNextPage() }}
+              disabled={currentPage >= maxPage}
+              className={cn(
+                'absolute right-2 md:right-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
+                'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
+                'text-foreground hover:bg-card hover:scale-110 transition-all',
+                'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
+                chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
+                'transition-opacity duration-500'
+              )}
+              aria-label="Next page"
+            >
+              <ChevronRight className="w-5 h-5 md:w-6 md:h-6" />
+            </button>
+          </>
+        )}
+
+        {/* Scroll down indicator in scroll mode */}
+        {scrollMode && currentPage === 0 && (
+          <div
+            className={cn(
+              'absolute bottom-14 left-1/2 -translate-x-1/2 flex flex-col items-center z-20 pointer-events-none transition-opacity duration-500',
+              chromeVisible ? 'opacity-70' : 'opacity-0'
+            )}
+          >
+            <span className="text-[11px] text-foreground/60 font-medium tracking-wide mb-1">SCROLL</span>
+            <ChevronDown className="w-5 h-5 text-foreground/40 animate-bounce" />
+          </div>
+        )}
 
 
         {/* Zoom indicator */}
@@ -1047,20 +1387,28 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
       </main>
 
       {/* Segmented progress bar — always visible */}
-      <div className="flex h-1.5 bg-muted gap-px">
+      <div className="group/progress relative" onMouseLeave={() => setHoveredSegment(null)}>
+        {/* Invisible hover target for easier interaction */}
+        <div className="absolute -top-3 inset-x-0 h-3" />
+        <div className="flex bg-muted gap-px h-[2px] group-hover/progress:h-[6px] transition-all duration-200">
         {pages.map((page, index) => {
           const isPast = index < currentPage
           const isCurrent = index === currentPage
           const hasVideoIndicator = !!page.video
+          const isPageBookmarked = isBookmarked(activeVolume, activeEpisode, index)
+          const dist = hoveredSegment !== null ? Math.abs(index - hoveredSegment) : -1
+          const flexGrow = hoveredSegment === null ? 1 : dist === 0 ? 3 : dist === 1 ? 2 : dist === 2 ? 1.5 : 1
 
           return (
             <button
               key={page.id}
               className={cn(
-                'relative flex-1 h-full cursor-pointer hover:brightness-125 focus:outline-none',
-                isPast ? 'bg-primary' : 'bg-muted'
+                'relative h-full cursor-pointer focus:outline-none transition-all duration-150',
+                hoveredSegment === index ? 'bg-red-900' : isPast ? 'bg-primary' : 'bg-muted'
               )}
+              style={{ flexGrow }}
               onClick={() => goToPage(index)}
+              onMouseEnter={() => setHoveredSegment(index)}
               title={page.title || `Page ${page.id}`}
             >
               {isCurrent && (
@@ -1072,12 +1420,13 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
                   }}
                 />
               )}
-              {hasVideoIndicator && (
+              {isPageBookmarked && (
                 <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-red-500" />
               )}
             </button>
           )
         })}
+      </div>
       </div>
 
       {/* Collapsible thumbnail panel — hidden in fullscreen, auto-hide with chrome */}
@@ -1146,6 +1495,41 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
         </div>
       )}
 
+      {/* Share link dialog */}
+      <Dialog open={showShareDialog} onOpenChange={setShowShareDialog}>
+        <DialogContent className="sm:max-w-md bg-black/90 backdrop-blur-2xl border border-white/10">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">Share this page</DialogTitle>
+          </DialogHeader>
+          <div className="flex items-center gap-2 mt-2">
+            <input
+              readOnly
+              value={`${typeof window !== 'undefined' ? window.location.origin : ''}/?vol=${activeVolume}&ep=${activeEpisode}&page=${currentPage + 1}`}
+              className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-primary/50 select-all"
+              onFocus={(e) => e.target.select()}
+            />
+            <button
+              onClick={() => {
+                const url = `${window.location.origin}/?vol=${activeVolume}&ep=${activeEpisode}&page=${currentPage + 1}`
+                navigator.clipboard.writeText(url).then(() => {
+                  setShareLinkCopied(true)
+                  setTimeout(() => setShareLinkCopied(false), 2000)
+                })
+              }}
+              className={cn(
+                'p-2 rounded-lg transition-colors',
+                shareLinkCopied
+                  ? 'bg-green-500/20 text-green-400'
+                  : 'bg-white/5 hover:bg-white/10 text-muted-foreground hover:text-foreground'
+              )}
+              title="Copy link"
+            >
+              {shareLinkCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Keyboard shortcuts button + dialog */}
       <Dialog open={showShortcuts} onOpenChange={setShowShortcuts}>
         <DialogTrigger asChild>
@@ -1172,6 +1556,10 @@ export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEp
               { keys: ['V'], desc: 'Toggle motion / static' },
               { keys: ['F'], desc: 'Toggle fullscreen' },
               { keys: ['T'], desc: 'Toggle thumbnail panel' },
+              { keys: ['Z'], desc: 'Zoom fit-width / fit-page' },
+              { keys: ['B'], desc: 'Bookmark current page' },
+              { keys: ['S'], desc: 'Toggle scroll / page mode' },
+              { keys: ['D'], desc: 'Toggle reading direction (LTR/RTL)' },
               { keys: ['Esc'], desc: 'Exit fullscreen / stop auto-play' },
               { keys: ['?'], desc: 'Show this dialog' },
             ].map(({ keys, desc }) => (

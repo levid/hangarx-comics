@@ -134,8 +134,8 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
 
   return (
     <div className={cn(
-      'relative w-full h-full bg-card overflow-hidden rounded-sm',
-      'shadow-[0_0_20px_rgba(0,0,0,0.5)]',
+      'relative w-full overflow-hidden rounded-sm',
+      forceContain ? 'h-auto max-h-full aspect-[2/3] bg-transparent shadow-none' : 'h-full bg-card shadow-[0_0_20px_rgba(0,0,0,0.5)]',
       className
     )}>
       {/* Page content */}
@@ -217,7 +217,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               alt={page.title || `Page ${page.id}`}
               fill
               className={cn(
-                forceContain ? 'object-contain transition-opacity duration-500' : 'object-contain md:object-cover transition-opacity duration-500',
+                forceContain ? 'object-contain transition-opacity duration-500 drop-shadow-[0_8px_24px_rgba(0,0,0,0.5)]' : 'object-contain md:object-cover transition-opacity duration-500',
                 isImageLoaded ? 'opacity-100' : 'opacity-0'
               )}
               onLoad={() => setIsImageLoaded(true)}

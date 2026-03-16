@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { assetUrl } from '@/lib/cdn'
 
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp'])
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm'])
@@ -32,7 +33,7 @@ export async function GET(request: NextRequest) {
             if (IMAGE_EXTENSIONS.has(ext)) {
                 const pageNum = extractPageNumber(file)
                 if (pageNum !== null) {
-                    imageMap.set(pageNum, `/comic/${safeVol}/${safeEp}/${file}`)
+                    imageMap.set(pageNum, assetUrl(`/comic/${safeVol}/${safeEp}/${file}`))
                 }
             }
         }
@@ -52,7 +53,7 @@ export async function GET(request: NextRequest) {
             if (VIDEO_EXTENSIONS.has(ext)) {
                 const pageNum = extractPageNumber(file)
                 if (pageNum !== null) {
-                    videoMap.set(pageNum, `/video/${safeVol}/${safeEp}/${file}`)
+                    videoMap.set(pageNum, assetUrl(`/video/${safeVol}/${safeEp}/${file}`))
                 }
             }
         }
