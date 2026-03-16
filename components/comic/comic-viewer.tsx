@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
+import Image from 'next/image'
+import gsap from 'gsap'
 import {
   ChevronLeft,
   ChevronRight,
@@ -14,7 +16,8 @@ import {
   Loader2,
   PlayCircle,
   PauseCircle,
-  Keyboard
+  Keyboard,
+  Library
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -24,8 +27,17 @@ import {
   DialogTitle,
   DialogTrigger
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { ComicPage } from './comic-page'
 import { useSwipe } from '@/hooks/use-swipe'
+import { useGsapAnimations } from '@/hooks/use-gsap-animations'
 import type { ComicPage as ComicPageType } from '@/lib/comic-data'
 import { cn } from '@/lib/utils'
 
@@ -41,17 +53,38 @@ interface ComicManifest {
   pages: ComicPageType[]
 }
 
+interface EpisodeInfo {
+  id: string
+  label: string
+  pageCount: number
+}
+
+interface VolumeInfo {
+  id: string
+  label: string
+  episodes: EpisodeInfo[]
+}
+
 // Default hold time for static pages during auto-play (ms)
 const STATIC_PAGE_DURATION = 4000
 // Chrome auto-hide delay (ms)
 const CHROME_HIDE_DELAY = 3000
 
-export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerProps) {
+export function ComicViewer({ volume: initialVolume = 'vol1', episode: initialEpisode = 'ep2' }: ComicViewerProps) {
+  // Active volume/episode (state-driven for in-viewer navigation)
+  const [activeVolume, setActiveVolume] = useState(initialVolume)
+  const [activeEpisode, setActiveEpisode] = useState(initialEpisode)
+  // Volume/episode listing for the dropdown
+  const [volumeList, setVolumeList] = useState<VolumeInfo[]>([])
+  // Which volumes are expanded in the tree view
+  const [expandedVolumes, setExpandedVolumes] = useState<Set<string>>(() => new Set([initialVolume]))
+  // Which episodes are expanded in the tree view (keyed as "vol:ep")
+  const [expandedEpisodes, setExpandedEpisodes] = useState<Set<string>>(() => new Set([`${initialVolume}:${initialEpisode}`]))
+
   // currentPage is a page INDEX (0-based) — always advances by 1
   const [currentPage, setCurrentPage] = useState(0)
   const [isVideoMode, setIsVideoMode] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [flipDirection, setFlipDirection] = useState<'left' | 'right' | null>(null)
   const [isMobile, setIsMobile] = useState(false)
   const [manifest, setManifest] = useState<ComicManifest | null>(null)
   const [loading, setLoading] = useState(true)
@@ -66,8 +99,46 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   const [autoPlaySlot, setAutoPlaySlot] = useState(0)
   const [forceSinglePage, setForceSinglePage] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
+  const [hoveredSegment, setHoveredSegment] = useState<number | null>(null)
+  const [toastMessage, setToastMessage] = useState<string | null>(null)
+  const toastRef = useRef<HTMLDivElement>(null)
+  const toastTimerRef = useRef<NodeJS.Timeout | null>(null)
   const staticAnimFrameRef = useRef<number | null>(null)
   const thumbnailScrollRef = useRef<HTMLDivElement>(null)
+  const glowRef = useRef<HTMLDivElement>(null)
+  const pageCounterRef = useRef<HTMLSpanElement>(null)
+  const headerRef = useRef<HTMLElement>(null)
+
+  // GSAP animation hook
+  const {
+    animatePageTransition,
+    animateThumbnailPanel,
+    animateGlowTransition,
+    animatePageNumber,
+  } = useGsapAnimations()
+
+  // Toast notification
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    setToastMessage(message)
+    requestAnimationFrame(() => {
+      if (toastRef.current) {
+        gsap.killTweensOf(toastRef.current)
+        gsap.fromTo(toastRef.current,
+          { y: 10, opacity: 0, scale: 0.95 },
+          { y: 0, opacity: 1, scale: 1, duration: 0.25, ease: 'power3.out' }
+        )
+      }
+    })
+    toastTimerRef.current = setTimeout(() => {
+      if (toastRef.current) {
+        gsap.to(toastRef.current, {
+          y: -6, opacity: 0, scale: 0.97, duration: 0.2, ease: 'power2.in',
+          onComplete: () => setToastMessage(null)
+        })
+      }
+    }, 1500)
+  }, [])
 
   // Auto-hiding chrome
   const [chromeVisible, setChromeVisible] = useState(true)
@@ -84,11 +155,19 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     setAudioFocusPageId(prev => prev === pageId ? null : pageId)
   }, [])
 
+  // Fetch volume/episode listing
+  useEffect(() => {
+    fetch('/api/comic/list')
+      .then(res => res.json())
+      .then(data => setVolumeList(data.volumes || []))
+      .catch(() => { })
+  }, [])
+
   // Fetch comic manifest from API
   useEffect(() => {
     setLoading(true)
     setError(null)
-    fetch(`/api/comic?vol=${encodeURIComponent(volume)}&ep=${encodeURIComponent(episode)}`)
+    fetch(`/api/comic?vol=${encodeURIComponent(activeVolume)}&ep=${encodeURIComponent(activeEpisode)}`)
       .then(res => {
         if (!res.ok) throw new Error(`Failed to load comic: ${res.statusText}`)
         return res.json()
@@ -99,7 +178,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
       })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [volume, episode])
+  }, [activeVolume, activeEpisode])
 
   // Check if mobile
   useEffect(() => {
@@ -158,40 +237,43 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     const step = pagesPerView
     const nextPage = Math.min(currentPage + step, maxPage)
     if (nextPage > currentPage) {
-      setFlipDirection('left')
       setVideoEndedCount(0)
       setAutoPlaySlot(0)
       setZoomScale(1)
-      setTimeout(() => {
-        setCurrentPage(nextPage)
-        setFlipDirection(null)
-      }, 150)
+      setCurrentPage(nextPage)
+      animatePageTransition(pageContainerRef.current, 'left')
+      animateGlowTransition(glowRef.current)
+      animatePageNumber(pageCounterRef.current)
     } else if (isAutoPlay) {
       setIsAutoPlay(false)
     }
-  }, [currentPage, maxPage, isAutoPlay, pagesPerView])
+  }, [currentPage, maxPage, isAutoPlay, pagesPerView, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   const goToPrevPage = useCallback(() => {
     if (currentPage > 0) {
       const step = pagesPerView
-      setFlipDirection('right')
       setVideoEndedCount(0)
       setAutoPlaySlot(0)
       setZoomScale(1)
-      setTimeout(() => {
-        setCurrentPage(prev => Math.max(prev - step, 0))
-        setFlipDirection(null)
-      }, 150)
+      setCurrentPage(prev => Math.max(prev - step, 0))
+      animatePageTransition(pageContainerRef.current, 'right')
+      animateGlowTransition(glowRef.current)
+      animatePageNumber(pageCounterRef.current)
     }
-  }, [currentPage, pagesPerView])
+  }, [currentPage, pagesPerView, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   const goToPage = useCallback((pageIndex: number) => {
-    setCurrentPage(Math.max(0, Math.min(pageIndex, maxPage)))
+    const targetPage = Math.max(0, Math.min(pageIndex, maxPage))
+    const direction = targetPage > currentPage ? 'left' : 'right'
+    setCurrentPage(targetPage)
     setVideoEndedCount(0)
     setAutoPlaySlot(0)
     setShowThumbnailPanel(false)
     setZoomScale(1)
-  }, [maxPage])
+    animatePageTransition(pageContainerRef.current, direction)
+    animateGlowTransition(glowRef.current)
+    animatePageNumber(pageCounterRef.current)
+  }, [maxPage, currentPage, animatePageTransition, animateGlowTransition, animatePageNumber])
 
   // --- Tap zones ---
   const handleTapZone = useCallback((e: React.MouseEvent<HTMLElement>) => {
@@ -441,15 +523,20 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     }
   }, [isAutoPlay, autoPlaySlotHasVideo, currentPage, autoPlaySlot])
 
-  // Auto-scroll thumbnail panel
+  // Auto-scroll thumbnail panel + animate thumbnails
   useEffect(() => {
     if (showThumbnailPanel && thumbnailScrollRef.current) {
+      // Animate thumbnails staggering in
+      animateThumbnailPanel(thumbnailScrollRef.current)
+      // Scroll to active thumbnail
       const activeThumb = thumbnailScrollRef.current.querySelector('[data-active="true"]')
       if (activeThumb) {
-        activeThumb.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+        setTimeout(() => {
+          activeThumb.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+        }, 100)
       }
     }
-  }, [showThumbnailPanel, currentPage])
+  }, [showThumbnailPanel, animateThumbnailPanel])
 
   // Loading state
   if (loading) {
@@ -479,7 +566,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   return (
     <div
       className={cn(
-        'flex flex-col bg-black transition-all duration-300',
+        'flex flex-col bg-black/60 transition-all duration-300',
         isFullscreen ? 'fixed inset-0 z-50' : 'w-full h-screen'
       )}
     >
@@ -487,26 +574,166 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
       {!isFullscreen && (
         <header
           className={cn(
-            'flex items-center justify-between px-4 md:px-6 py-3 border-b border-border bg-card/50 backdrop-blur-sm transition-all duration-500 z-10',
-            chromeVisible ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-full pointer-events-none'
+            'flex items-center justify-between px-4 md:px-6 border-b border-white/10 bg-black/30 backdrop-blur-xl transition-all duration-500 z-10 overflow-hidden',
+            chromeVisible ? 'py-3 max-h-20 opacity-100' : 'py-0 max-h-0 opacity-0 border-transparent pointer-events-none'
           )}
         >
           <div className="flex items-center gap-3">
-            <BookOpen className="w-5 h-5 text-primary" />
-            <div>
-              <h1 className="text-lg font-bold text-foreground">{manifest.title}</h1>
-              <p className="text-xs text-muted-foreground">
-                {manifest.volume} — {manifest.episode} · {pages.length} pages
-              </p>
-            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button className="flex items-center gap-2.5 hover:bg-white/5 rounded-xl px-2.5 py-1.5 -ml-2.5 transition-colors group focus:outline-none">
+                  <Library className="w-5 h-5 text-primary" />
+                  <div className="text-left">
+                    <h1 className="text-sm font-semibold text-foreground tracking-wide uppercase">
+                      {activeVolume.replace('vol', 'Vol ')} — {activeEpisode.replace('ep', 'Ep ')}
+                    </h1>
+                    <p className="text-[10px] text-muted-foreground">
+                      {pages.length} pages
+                    </p>
+                  </div>
+                  <ChevronDown className="w-3.5 h-3.5 text-muted-foreground group-hover:text-foreground transition-colors" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="w-64 max-h-[70vh] overflow-y-auto p-1.5 bg-black/85 backdrop-blur-2xl border border-white/[0.08] rounded-xl shadow-2xl shadow-black/50"
+              >
+                {volumeList.map((vol, volIdx) => {
+                  const isActiveVol = vol.id === activeVolume
+                  const isExpanded = expandedVolumes.has(vol.id)
+                  const isLastVol = volIdx === volumeList.length - 1
+
+                  return (
+                    <div key={vol.id}>
+                      {/* Volume header */}
+                      <DropdownMenuItem
+                        className={cn(
+                          'flex items-center gap-2 text-[13px] font-semibold cursor-pointer rounded-lg py-2.5 px-3 focus:outline-none',
+                          isActiveVol ? 'text-foreground' : 'text-foreground/60'
+                        )}
+                        onSelect={(e) => {
+                          e.preventDefault()
+                          setExpandedVolumes(prev => {
+                            const next = new Set(prev)
+                            if (next.has(vol.id)) next.delete(vol.id)
+                            else next.add(vol.id)
+                            return next
+                          })
+                        }}
+                      >
+                        <ChevronRight className={cn(
+                          'w-3 h-3 transition-transform duration-200 shrink-0',
+                          isExpanded ? 'rotate-90 text-foreground/60' : 'text-foreground/30'
+                        )} />
+                        <span className="flex-1">{vol.label}</span>
+                        {isActiveVol && (
+                          <div className="w-1.5 h-1.5 rounded-full bg-primary shrink-0" />
+                        )}
+                        <span className="text-[10px] text-foreground/25 font-normal tabular-nums">
+                          {vol.episodes.length}
+                        </span>
+                      </DropdownMenuItem>
+
+                      {/* Episodes */}
+                      {isExpanded && (
+                        <div className="pb-1">
+                          {vol.episodes.map((ep) => {
+                            const isActiveEp = isActiveVol && ep.id === activeEpisode
+                            const epKey = `${vol.id}:${ep.id}`
+                            const isEpExpanded = expandedEpisodes.has(epKey)
+
+                            return (
+                              <div key={ep.id}>
+                                <DropdownMenuItem
+                                  className={cn(
+                                    'flex items-center gap-2 text-[12px] ml-4 mr-1 rounded-lg py-2 px-2.5 cursor-pointer focus:outline-none',
+                                    isActiveEp
+                                      ? 'bg-white/[0.08] text-foreground font-medium'
+                                      : 'text-foreground/45 hover:text-foreground/75'
+                                  )}
+                                  onSelect={(e) => {
+                                    e.preventDefault()
+                                    setExpandedEpisodes(prev => {
+                                      const next = new Set(prev)
+                                      if (next.has(epKey)) next.delete(epKey)
+                                      else next.add(epKey)
+                                      return next
+                                    })
+                                    if (!isActiveEp) {
+                                      setActiveVolume(vol.id)
+                                      setActiveEpisode(ep.id)
+                                    }
+                                  }}
+                                >
+                                  <ChevronRight className={cn(
+                                    'w-2.5 h-2.5 transition-transform duration-200 shrink-0',
+                                    isEpExpanded ? 'rotate-90 text-foreground/50' : 'text-foreground/20'
+                                  )} />
+                                  <span className="flex-1">{ep.label}</span>
+                                  <span className="text-[10px] text-foreground/20 font-normal tabular-nums">
+                                    {ep.pageCount}
+                                  </span>
+                                </DropdownMenuItem>
+
+                                {/* Page grid */}
+                                {isEpExpanded && ep.pageCount > 0 && (
+                                  <div className="page-grid-container ml-9 mr-2 py-1.5 pb-2">
+                                    <div className="grid grid-cols-5 gap-1">
+                                      {Array.from({ length: ep.pageCount }, (_, i) => {
+                                        const isActivePage = isActiveEp && i === currentPage
+                                        return (
+                                          <button
+                                            key={i}
+                                            onClick={() => {
+                                              if (!isActiveEp) {
+                                                setActiveVolume(vol.id)
+                                                setActiveEpisode(ep.id)
+                                              }
+                                              goToPage(i)
+                                            }}
+                                            className={cn(
+                                              'text-[10px] py-1 rounded text-center transition-all tabular-nums focus:outline-none',
+                                              isActivePage
+                                                ? 'bg-primary text-primary-foreground font-semibold'
+                                                : 'bg-white/[0.03] hover:bg-white/[0.08] text-foreground/30 hover:text-foreground/60'
+                                            )}
+                                          >
+                                            {i + 1}
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+
+                      {!isLastVol && <DropdownMenuSeparator className="my-1 bg-white/[0.04]" />}
+                    </div>
+                  )
+                })}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
+
+          {/* Centered page counter */}
+          <span ref={pageCounterRef} className="absolute left-1/2 -translate-x-1/2 text-xs text-foreground/70 font-medium tabular-nums">
+            {currentPage + 1}{currentPages.length > 1 ? `–${currentPage + currentPages.length}` : ''} / {pages.length}
+          </span>
 
           <div className="flex items-center gap-2">
             {/* Auto-play toggle */}
             <Button
               variant={isAutoPlay ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setIsAutoPlay(!isAutoPlay)}
+              onClick={() => {
+                const next = !isAutoPlay
+                setIsAutoPlay(next)
+                showToast(next ? 'Autoplay enabled' : 'Autoplay paused')
+              }}
               className="gap-2"
               title={isAutoPlay ? 'Pause auto-play (Space)' : 'Auto-play (Space)'}
             >
@@ -517,7 +744,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             {/* Mode segmented toggle */}
             <div className="flex rounded-md border border-border overflow-hidden">
               <button
-                onClick={() => setIsVideoMode(false)}
+                onClick={() => {
+                  setIsVideoMode(false)
+                  showToast('Static mode')
+                }}
                 className={cn(
                   'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                   !isVideoMode
@@ -529,7 +759,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                 <span className="hidden sm:inline">Static</span>
               </button>
               <button
-                onClick={() => setIsVideoMode(true)}
+                onClick={() => {
+                  setIsVideoMode(true)
+                  showToast('Motion mode')
+                }}
                 className={cn(
                   'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                   isVideoMode
@@ -546,7 +779,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             {!isMobile && (
               <div className="flex rounded-md border border-border overflow-hidden">
                 <button
-                  onClick={() => setForceSinglePage(true)}
+                  onClick={() => {
+                    setForceSinglePage(true)
+                    showToast('Single page view')
+                  }}
                   className={cn(
                     'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                     forceSinglePage
@@ -559,7 +795,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                   <span className="hidden sm:inline">Single</span>
                 </button>
                 <button
-                  onClick={() => setForceSinglePage(false)}
+                  onClick={() => {
+                    setForceSinglePage(false)
+                    showToast('Split page view')
+                  }}
                   className={cn(
                     'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                     !forceSinglePage
@@ -666,19 +905,39 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         onMouseLeave={swipeHandlers.onMouseLeave}
       >
 
+        {/* Ambient backlight glow — dynamically matches current page colors */}
+        {pages[currentPage]?.image && (
+          <div
+            ref={glowRef}
+            className="absolute inset-0 flex items-center justify-center pointer-events-none z-0"
+            style={{ opacity: 0.5 }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              key={currentPage}
+              src={pages[currentPage].image}
+              alt=""
+              className="w-full h-full object-contain"
+              style={{
+                filter: 'blur(60px) saturate(1.8)',
+                transform: 'scale(1.15)',
+                willChange: 'transform',
+              }}
+            />
+          </div>
+        )}
+
         {/* Book wrapper */}
         <div className={cn(
-          'absolute flex items-center justify-center',
+          'absolute flex items-center justify-center z-[1]',
           isFullscreen ? 'inset-1' : 'inset-2 sm:inset-4 md:inset-8'
         )}>
           {/* Page spread container with zoom */}
           <div
             ref={pageContainerRef}
             className={cn(
-              'relative flex gap-0.5 sm:gap-1 md:gap-2 h-full max-w-full transition-transform duration-300',
-              isSinglePage ? 'max-h-full' : 'max-h-[85vh]',
-              flipDirection === 'left' && 'animate-flip-left',
-              flipDirection === 'right' && 'animate-flip-right'
+              'relative flex gap-0.5 sm:gap-1 md:gap-2 h-full max-w-full',
+              isSinglePage ? 'max-h-full' : 'max-h-[85vh]'
             )}
             style={{
               aspectRatio: isSinglePage ? '3/4' : '4/3',
@@ -710,6 +969,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                     onVideoProgress={index === autoPlaySlot ? handleVideoProgress : undefined}
                     onToggleMotion={() => setIsVideoMode(false)}
                     autoPlayActive={isAutoPlay && index === autoPlaySlot}
+                    forceContain={false}
                     className={cn(
                       !isSinglePage && index === 0 && 'rounded-r-none',
                       !isSinglePage && index === 1 && 'rounded-l-none'
@@ -777,20 +1037,6 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
           <ChevronRight className="w-5 h-5 md:w-6 md:h-6" />
         </button>
 
-        {/* Page indicator — auto-hide with chrome, hidden in fullscreen */}
-        {!isFullscreen && (
-          <div
-            className={cn(
-              'absolute bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1 sm:px-4 sm:py-2 rounded-full bg-card/80 backdrop-blur-sm border border-border z-20',
-              'transition-opacity duration-500',
-              chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-            )}
-          >
-            <span className="text-xs sm:text-sm text-foreground font-medium">
-              {currentPage + 1}{currentPages.length > 1 ? `–${currentPage + currentPages.length}` : ''} / {pages.length}
-            </span>
-          </div>
-        )}
 
         {/* Zoom indicator */}
         {zoomScale > 1 && (
@@ -811,8 +1057,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             <button
               key={page.id}
               className={cn(
-                'relative flex-1 h-full cursor-pointer',
-                'hover:brightness-125',
+                'relative flex-1 h-full cursor-pointer hover:brightness-125 focus:outline-none',
                 isPast ? 'bg-primary' : 'bg-muted'
               )}
               onClick={() => goToPage(index)}
@@ -852,7 +1097,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             {showThumbnailPanel ? (
               <><ChevronDown className="w-3.5 h-3.5" /><span>Hide pages</span></>
             ) : (
-              <><ChevronUp className="w-3.5 h-3.5" /><span>Show pages · {currentPage + 1} / {pages.length}</span></>
+              <><ChevronUp className="w-3.5 h-3.5" /><span ref={pageCounterRef}>Show pages · {currentPage + 1} / {pages.length}</span></>
             )}
           </button>
 
@@ -861,6 +1106,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             <div
               ref={thumbnailScrollRef}
               className="flex gap-2 px-3 pb-3 overflow-x-auto"
+              style={{ willChange: 'transform' }}
             >
               {pages.map((page, index) => {
                 const isCurrentThumb = index === currentPage
@@ -876,9 +1122,13 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                         : 'border-border/50 hover:border-primary/50 opacity-70 hover:opacity-100'
                     )}
                   >
-                    <img
+                    <Image
                       src={page.image}
                       alt={page.title || `Page ${page.id}`}
+                      width={80}
+                      height={107}
+                      sizes="80px"
+                      quality={30}
                       className="w-full h-full object-cover"
                       loading="lazy"
                     />
@@ -901,7 +1151,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         <DialogTrigger asChild>
           <button
             className={cn(
-              'absolute bottom-6 right-4 hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-all shadow-sm z-20',
+              showThumbnailPanel ? 'absolute bottom-44 right-4 hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-all shadow-sm z-20' : 'absolute bottom-12 right-4 hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-all shadow-sm z-20',
               chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
               'duration-500'
             )}
@@ -942,6 +1192,16 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
           </p>
         </DialogContent>
       </Dialog>
+
+      {/* Toast notification */}
+      {toastMessage && (
+        <div
+          ref={toastRef}
+          className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-black/70 backdrop-blur-xl border border-white/[0.08] text-xs text-foreground/80 font-medium shadow-lg pointer-events-none whitespace-nowrap"
+        >
+          {toastMessage}
+        </div>
+      )}
     </div>
   )
 }

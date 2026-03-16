@@ -17,6 +17,7 @@ interface ComicPageProps {
   onVideoProgress?: (progress: number) => void
   onToggleMotion?: () => void
   autoPlayActive?: boolean
+  forceContain?: boolean
   className?: string
 }
 
@@ -59,7 +60,7 @@ function InteractiveHotspot({ element, onClick }: { element: InteractiveElement;
   )
 }
 
-export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted = true, onAudioFocus, onVideoEnded, onVideoProgress, onToggleMotion, autoPlayActive = false, className }: ComicPageProps) {
+export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted = true, onAudioFocus, onVideoEnded, onVideoProgress, onToggleMotion, autoPlayActive = false, forceContain = false, className }: ComicPageProps) {
   const [showPopup, setShowPopup] = useState<string | null>(null)
   const [isImageLoaded, setIsImageLoaded] = useState(false)
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -153,7 +154,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               src={page.image}
               alt={page.title || `Page ${page.id}`}
               fill
-              className="object-contain md:object-cover"
+              className={forceContain ? 'object-contain' : 'object-contain md:object-cover'}
               priority
             />
             {/* Video overlay */}
@@ -165,7 +166,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               loop={!autoPlayActive}
               playsInline
               preload={isActive || shouldPreload ? 'auto' : 'none'}
-              className="absolute inset-0 w-full h-full object-contain md:object-cover z-[1]"
+              className={`absolute inset-0 w-full h-full ${forceContain ? 'object-contain' : 'object-contain md:object-cover'} z-[1]`}
             />
             {/* Audio state indicator */}
             <button
@@ -189,7 +190,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               alt={page.title || `Page ${page.id}`}
               fill
               className={cn(
-                'object-contain md:object-cover transition-opacity duration-500',
+                forceContain ? 'object-contain transition-opacity duration-500' : 'object-contain md:object-cover transition-opacity duration-500',
                 isImageLoaded ? 'opacity-100' : 'opacity-0'
               )}
               onLoad={() => setIsImageLoaded(true)}
@@ -216,7 +217,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               alt={page.title || `Page ${page.id}`}
               fill
               className={cn(
-                'object-contain md:object-cover transition-opacity duration-500',
+                forceContain ? 'object-contain transition-opacity duration-500' : 'object-contain md:object-cover transition-opacity duration-500',
                 isImageLoaded ? 'opacity-100' : 'opacity-0'
               )}
               onLoad={() => setIsImageLoaded(true)}
