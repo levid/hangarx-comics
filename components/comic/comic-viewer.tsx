@@ -43,6 +43,8 @@ interface ComicManifest {
 
 // Default hold time for static pages during auto-play (ms)
 const STATIC_PAGE_DURATION = 4000
+// Chrome auto-hide delay (ms)
+const CHROME_HIDE_DELAY = 3000
 
 export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerProps) {
   // currentPage is a page INDEX (0-based) — always advances by 1
@@ -60,10 +62,22 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   const [videoEndedCount, setVideoEndedCount] = useState(0)
   const [pageProgress, setPageProgress] = useState(0)
   const [showThumbnailPanel, setShowThumbnailPanel] = useState(false)
+  // Which slot in the spread is currently auto-playing (0 = first/left, 1 = second/right)
+  const [autoPlaySlot, setAutoPlaySlot] = useState(0)
   const [forceSinglePage, setForceSinglePage] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const staticAnimFrameRef = useRef<number | null>(null)
   const thumbnailScrollRef = useRef<HTMLDivElement>(null)
+
+  // Auto-hiding chrome
+  const [chromeVisible, setChromeVisible] = useState(true)
+  const chromeTimerRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Pinch-to-zoom
+  const [zoomScale, setZoomScale] = useState(1)
+  const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 })
+  const pageContainerRef = useRef<HTMLDivElement>(null)
+  const lastTouchDistRef = useRef<number | null>(null)
 
   // Handle clicking a page to toggle its audio
   const handlePageAudioFocus = useCallback((pageId: number) => {
@@ -96,45 +110,161 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   }, [])
 
   const pages = manifest?.pages ?? []
-  // Cover page (P0 / id === 0) is always shown solo
+  // Cover page (P0 / id === 0) and last page are always shown solo
   const isCoverPage = pages[currentPage]?.id === 0
+  const isLastPage = currentPage === pages.length - 1
   // How many pages to DISPLAY at once (1 or 2)
-  const pagesPerView = (isMobile || isFullscreen || forceSinglePage || isCoverPage) ? 1 : 2
+  const pagesPerView = (isMobile || isFullscreen || forceSinglePage || isCoverPage || isLastPage) ? 1 : 2
   const isSinglePage = pagesPerView === 1
   // Total steps = total pages (always advance 1 at a time)
   const totalSteps = pages.length
   // Clamp currentPage so it doesn't go past the last valid start
   const maxPage = Math.max(0, pages.length - 1)
 
+  // --- Chrome auto-hide ---
+  const resetChromeTimer = useCallback(() => {
+    setChromeVisible(true)
+    if (chromeTimerRef.current) clearTimeout(chromeTimerRef.current)
+    chromeTimerRef.current = setTimeout(() => {
+      setChromeVisible(false)
+    }, CHROME_HIDE_DELAY)
+  }, [])
+
+  const toggleChrome = useCallback(() => {
+    if (chromeVisible) {
+      setChromeVisible(false)
+      if (chromeTimerRef.current) clearTimeout(chromeTimerRef.current)
+    } else {
+      resetChromeTimer()
+    }
+  }, [chromeVisible, resetChromeTimer])
+
+  // Start chrome timer on mount, reset on navigation
+  useEffect(() => {
+    resetChromeTimer()
+    return () => {
+      if (chromeTimerRef.current) clearTimeout(chromeTimerRef.current)
+    }
+  }, [currentPage, resetChromeTimer])
+
+  // Reset chrome timer on mouse movement (desktop)
+  useEffect(() => {
+    const handleMove = () => resetChromeTimer()
+    window.addEventListener('mousemove', handleMove)
+    return () => window.removeEventListener('mousemove', handleMove)
+  }, [resetChromeTimer])
+
   const goToNextPage = useCallback(() => {
-    if (currentPage < maxPage) {
+    const step = pagesPerView
+    const nextPage = Math.min(currentPage + step, maxPage)
+    if (nextPage > currentPage) {
       setFlipDirection('left')
       setVideoEndedCount(0)
+      setAutoPlaySlot(0)
+      setZoomScale(1)
       setTimeout(() => {
-        setCurrentPage(prev => Math.min(prev + 1, maxPage))
+        setCurrentPage(nextPage)
         setFlipDirection(null)
       }, 150)
     } else if (isAutoPlay) {
       setIsAutoPlay(false)
     }
-  }, [currentPage, maxPage, isAutoPlay])
+  }, [currentPage, maxPage, isAutoPlay, pagesPerView])
 
   const goToPrevPage = useCallback(() => {
     if (currentPage > 0) {
+      const step = pagesPerView
       setFlipDirection('right')
       setVideoEndedCount(0)
+      setAutoPlaySlot(0)
+      setZoomScale(1)
       setTimeout(() => {
-        setCurrentPage(prev => Math.max(prev - 1, 0))
+        setCurrentPage(prev => Math.max(prev - step, 0))
         setFlipDirection(null)
       }, 150)
     }
-  }, [currentPage])
+  }, [currentPage, pagesPerView])
 
   const goToPage = useCallback((pageIndex: number) => {
     setCurrentPage(Math.max(0, Math.min(pageIndex, maxPage)))
     setVideoEndedCount(0)
+    setAutoPlaySlot(0)
     setShowThumbnailPanel(false)
+    setZoomScale(1)
   }, [maxPage])
+
+  // --- Tap zones ---
+  const handleTapZone = useCallback((e: React.MouseEvent<HTMLElement>) => {
+    // Don't handle taps when zoomed in
+    if (zoomScale > 1) return
+
+    // Don't intercept clicks on interactive elements (buttons, links, etc.)
+    const target = e.target as HTMLElement
+    if (target.closest('button, a, [role="button"], input, select, textarea, video')) return
+
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = (e.clientX - rect.left) / rect.width
+
+    if (x < 0.3) {
+      // Left 30% — go back
+      goToPrevPage()
+    } else if (x > 0.7) {
+      // Right 30% — go forward
+      goToNextPage()
+    } else {
+      // Center 40% — toggle chrome
+      toggleChrome()
+    }
+  }, [goToPrevPage, goToNextPage, toggleChrome, zoomScale])
+
+  // --- Pinch-to-zoom ---
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX
+      const dy = e.touches[0].clientY - e.touches[1].clientY
+      lastTouchDistRef.current = Math.hypot(dx, dy)
+
+      // Set zoom origin to midpoint
+      const container = pageContainerRef.current
+      if (container) {
+        const rect = container.getBoundingClientRect()
+        const midX = ((e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left) / rect.width * 100
+        const midY = ((e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top) / rect.height * 100
+        setZoomOrigin({ x: midX, y: midY })
+      }
+    }
+  }, [])
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 2 && lastTouchDistRef.current !== null) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX
+      const dy = e.touches[0].clientY - e.touches[1].clientY
+      const dist = Math.hypot(dx, dy)
+      const scaleDelta = dist / lastTouchDistRef.current
+
+      setZoomScale(prev => {
+        const next = prev * scaleDelta
+        return Math.max(1, Math.min(next, 4)) // Clamp between 1x and 4x
+      })
+      lastTouchDistRef.current = dist
+    }
+  }, [])
+
+  const handleTouchEnd = useCallback(() => {
+    lastTouchDistRef.current = null
+    // Snap back to 1x if close
+    setZoomScale(prev => prev < 1.1 ? 1 : prev)
+  }, [])
+
+  // Double-tap to reset zoom (desktop double-click)
+  const handleDoubleClick = useCallback(() => {
+    if (zoomScale > 1) {
+      setZoomScale(1)
+    } else {
+      setZoomScale(2.5)
+      setZoomOrigin({ x: 50, y: 50 })
+    }
+  }, [zoomScale])
 
   // Swipe handlers
   const { handlers: swipeHandlers } = useSwipe({
@@ -146,6 +276,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      resetChromeTimer()
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
         goToNextPage()
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
@@ -153,8 +284,13 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
       } else if (e.key === 'Escape') {
         setIsFullscreen(false)
         setIsAutoPlay(false)
+        setZoomScale(1)
       } else if (e.key === 'f') {
-        setIsFullscreen(prev => !prev)
+        setIsFullscreen(prev => {
+          if (!prev) setChromeVisible(false) // entering fullscreen — hide chrome
+          else resetChromeTimer() // exiting — show chrome briefly
+          return !prev
+        })
       } else if (e.key === 'v') {
         setIsVideoMode(prev => !prev)
       } else if (e.key === ' ') {
@@ -168,14 +304,13 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [goToNextPage, goToPrevPage])
+  }, [goToNextPage, goToPrevPage, resetChromeTimer])
 
-  // Current visible pages: starting at currentPage, show pagesPerView
+  // Current visible pages
   const currentPages = useMemo(() => {
     return pages.slice(currentPage, Math.min(currentPage + pagesPerView, pages.length))
   }, [pages, currentPage, pagesPerView])
 
-  // Active page indices
   const activePageIndices = useMemo(() => {
     const indices = new Set<number>()
     for (let i = currentPage; i < currentPage + pagesPerView && i < pages.length; i++) {
@@ -184,14 +319,11 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     return indices
   }, [currentPage, pagesPerView, pages.length])
 
-  // Preload adjacent pages
   const preloadPageIndices = useMemo(() => {
     const indices = new Set<number>()
-    // Previous page
     if (currentPage - 1 >= 0 && !activePageIndices.has(currentPage - 1)) {
       indices.add(currentPage - 1)
     }
-    // Next pages beyond the current view
     const nextStart = currentPage + pagesPerView
     for (let i = nextStart; i < nextStart + pagesPerView && i < pages.length; i++) {
       if (!activePageIndices.has(i)) indices.add(i)
@@ -199,14 +331,18 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     return indices
   }, [currentPage, pagesPerView, pages.length, activePageIndices])
 
-  // Count videos on the currently visible pages (the first page drives auto-play)
-  const currentPageHasVideo = useMemo(() => {
-    if (!isVideoMode) return false
-    const page = pages[currentPage]
-    return page ? !!page.video : false
-  }, [pages, currentPage, isVideoMode])
+  // Auto-play: determine which slot's page has video
+  const autoPlaySlotPage = useMemo(() => {
+    const idx = currentPage + autoPlaySlot
+    return idx < pages.length ? pages[idx] : null
+  }, [pages, currentPage, autoPlaySlot])
 
-  // Auto-play logic: only waits for the CURRENT page's video
+  const autoPlaySlotHasVideo = useMemo(() => {
+    if (!isVideoMode) return false
+    return autoPlaySlotPage ? !!autoPlaySlotPage.video : false
+  }, [isVideoMode, autoPlaySlotPage])
+
+  // Auto-play logic — sequential slot-based
   useEffect(() => {
     if (!isAutoPlay) {
       if (autoPlayTimerRef.current) {
@@ -216,16 +352,31 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
       return
     }
 
-    if (currentPageHasVideo) {
-      // Wait for the current page's video to end
+    // Current slot has video? Wait for it to finish
+    if (autoPlaySlotHasVideo) {
       if (videoEndedCount < 1) return
-      goToNextPage()
+      // Video ended — move to next slot or advance
+      if (autoPlaySlot < pagesPerView - 1 && currentPage + autoPlaySlot + 1 < pages.length) {
+        // Move to next slot in the spread
+        setAutoPlaySlot(prev => prev + 1)
+        setVideoEndedCount(0)
+        setPageProgress(0)
+      } else {
+        // All slots done — advance to next spread
+        goToNextPage()
+      }
       return
     }
 
-    // Static page — use timer
+    // Static page — use timer, then move to next slot or advance
     autoPlayTimerRef.current = setTimeout(() => {
-      goToNextPage()
+      if (autoPlaySlot < pagesPerView - 1 && currentPage + autoPlaySlot + 1 < pages.length) {
+        setAutoPlaySlot(prev => prev + 1)
+        setVideoEndedCount(0)
+        setPageProgress(0)
+      } else {
+        goToNextPage()
+      }
     }, STATIC_PAGE_DURATION)
 
     return () => {
@@ -234,36 +385,36 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         autoPlayTimerRef.current = null
       }
     }
-  }, [isAutoPlay, currentPage, currentPageHasVideo, videoEndedCount, goToNextPage])
+  }, [isAutoPlay, currentPage, autoPlaySlot, autoPlaySlotHasVideo, videoEndedCount, goToNextPage, pagesPerView, pages.length])
 
   const handleVideoEnded = useCallback(() => {
     setVideoEndedCount(prev => prev + 1)
   }, [])
 
-  // Video progress for segmented bar
   const handleVideoProgress = useCallback((prog: number) => {
     setPageProgress(prog)
   }, [])
 
-  // Reset progress on page change
+  // Reset progress and slot on page change
   useEffect(() => {
     setVideoEndedCount(0)
     setPageProgress(0)
+    setAutoPlaySlot(0)
   }, [currentPage])
 
-  // Auto-unmute the current video page during auto-play + motion mode
+  // Auto-unmute: audio follows the active auto-play slot
   useEffect(() => {
     if (isAutoPlay && isVideoMode) {
-      const page = pages[currentPage]
-      if (page?.video) {
-        setAudioFocusPageId(page.id)
+      const slotPage = pages[currentPage + autoPlaySlot]
+      if (slotPage?.video) {
+        setAudioFocusPageId(slotPage.id)
       }
     }
-  }, [isAutoPlay, isVideoMode, currentPage, pages])
+  }, [isAutoPlay, isVideoMode, currentPage, autoPlaySlot, pages])
 
   // Animate static page progress during auto-play
   useEffect(() => {
-    if (!isAutoPlay || currentPageHasVideo) {
+    if (!isAutoPlay || autoPlaySlotHasVideo) {
       if (staticAnimFrameRef.current) {
         cancelAnimationFrame(staticAnimFrameRef.current)
         staticAnimFrameRef.current = null
@@ -272,7 +423,6 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     }
 
     const startTime = performance.now()
-
     const animate = (now: number) => {
       const elapsed = now - startTime
       const frac = Math.min(elapsed / STATIC_PAGE_DURATION, 1)
@@ -281,7 +431,6 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         staticAnimFrameRef.current = requestAnimationFrame(animate)
       }
     }
-
     staticAnimFrameRef.current = requestAnimationFrame(animate)
 
     return () => {
@@ -290,9 +439,9 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         staticAnimFrameRef.current = null
       }
     }
-  }, [isAutoPlay, currentPageHasVideo, currentPage])
+  }, [isAutoPlay, autoPlaySlotHasVideo, currentPage, autoPlaySlot])
 
-  // Auto-scroll thumbnail panel to current page
+  // Auto-scroll thumbnail panel
   useEffect(() => {
     if (showThumbnailPanel && thumbnailScrollRef.current) {
       const activeThumb = thumbnailScrollRef.current.querySelector('[data-active="true"]')
@@ -302,13 +451,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
     }
   }, [showThumbnailPanel, currentPage])
 
-  // Progress percentage
-  const progress = totalSteps > 0 ? ((currentPage + 1) / totalSteps) * 100 : 0
-
   // Loading state
   if (loading) {
     return (
-      <div className="flex items-center justify-center w-full h-screen bg-background">
+      <div className="flex items-center justify-center w-full h-screen bg-black">
         <div className="flex flex-col items-center gap-4">
           <Loader2 className="w-8 h-8 animate-spin text-primary" />
           <p className="text-muted-foreground text-sm">Loading comic…</p>
@@ -320,7 +466,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   // Error state
   if (error || !manifest) {
     return (
-      <div className="flex items-center justify-center w-full h-screen bg-background">
+      <div className="flex items-center justify-center w-full h-screen bg-black">
         <div className="flex flex-col items-center gap-4 text-center px-4">
           <BookOpen className="w-10 h-10 text-destructive" />
           <p className="text-foreground font-medium">Failed to load comic</p>
@@ -333,13 +479,18 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
   return (
     <div
       className={cn(
-        'flex flex-col bg-background transition-all duration-300',
+        'flex flex-col bg-black transition-all duration-300',
         isFullscreen ? 'fixed inset-0 z-50' : 'w-full h-screen'
       )}
     >
-      {/* Header — hidden in fullscreen */}
+      {/* Header — hidden in fullscreen, auto-hides with chrome */}
       {!isFullscreen && (
-        <header className="flex items-center justify-between px-4 md:px-6 py-3 border-b border-border bg-card/50 backdrop-blur-sm">
+        <header
+          className={cn(
+            'flex items-center justify-between px-4 md:px-6 py-3 border-b border-border bg-card/50 backdrop-blur-sm transition-all duration-500 z-10',
+            chromeVisible ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-full pointer-events-none'
+          )}
+        >
           <div className="flex items-center gap-3">
             <BookOpen className="w-5 h-5 text-primary" />
             <div>
@@ -380,7 +531,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
               <button
                 onClick={() => setIsVideoMode(true)}
                 className={cn(
-                  'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors border-l border-border',
+                  'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                   isVideoMode
                     ? 'bg-primary text-primary-foreground'
                     : 'bg-card text-muted-foreground hover:text-foreground hover:bg-muted'
@@ -410,7 +561,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                 <button
                   onClick={() => setForceSinglePage(false)}
                   className={cn(
-                    'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors border-l border-border',
+                    'flex items-center gap-1.5 px-2.5 py-1.5 text-sm transition-colors',
                     !forceSinglePage
                       ? 'bg-primary text-primary-foreground'
                       : 'bg-card text-muted-foreground hover:text-foreground hover:bg-muted'
@@ -427,7 +578,16 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             <Button
               variant={isFullscreen ? 'default' : 'outline'}
               size="sm"
-              onClick={() => setIsFullscreen(!isFullscreen)}
+              className="hidden md:inline-flex"
+              onClick={() => {
+                setIsFullscreen(!isFullscreen)
+                if (!isFullscreen) {
+                  setChromeVisible(false)
+                  if (chromeTimerRef.current) clearTimeout(chromeTimerRef.current)
+                } else {
+                  resetChromeTimer()
+                }
+              }}
               title={isFullscreen ? 'Exit fullscreen (F)' : 'Fullscreen single-page (F)'}
             >
               {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -436,9 +596,14 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         </header>
       )}
 
-      {/* Floating controls in fullscreen */}
+      {/* Floating controls in fullscreen — auto-hide with chrome */}
       {isFullscreen && (
-        <div className="absolute top-4 right-4 z-20 flex items-center gap-2 opacity-0 hover:opacity-100 focus-within:opacity-100 transition-opacity duration-300">
+        <div
+          className={cn(
+            'absolute top-4 right-4 z-20 flex items-center gap-2 transition-opacity duration-500',
+            chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          )}
+        >
           <Button
             variant="secondary"
             size="sm"
@@ -460,7 +625,7 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
             <button
               onClick={() => setIsVideoMode(true)}
               className={cn(
-                'flex items-center px-2 py-1.5 transition-colors border-l border-border',
+                'flex items-center px-2 py-1.5 transition-colors',
                 isVideoMode ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'
               )}
             >
@@ -478,26 +643,49 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         </div>
       )}
 
-      {/* Main viewer area */}
+      {/* Main viewer area — with tap zones */}
       <main
         className="flex-1 relative overflow-hidden select-none"
-        {...swipeHandlers}
+        onClick={handleTapZone}
+        onDoubleClick={handleDoubleClick}
+        onTouchStart={(e) => {
+          handleTouchStart(e)
+          swipeHandlers.onTouchStart(e)
+        }}
+        onTouchMove={(e) => {
+          handleTouchMove(e)
+          swipeHandlers.onTouchMove(e)
+        }}
+        onTouchEnd={() => {
+          handleTouchEnd()
+          swipeHandlers.onTouchEnd()
+        }}
+        onMouseDown={swipeHandlers.onMouseDown}
+        onMouseMove={swipeHandlers.onMouseMove}
+        onMouseUp={swipeHandlers.onMouseUp}
+        onMouseLeave={swipeHandlers.onMouseLeave}
       >
+
         {/* Book wrapper */}
         <div className={cn(
           'absolute flex items-center justify-center',
-          isFullscreen ? 'inset-2' : 'inset-4 md:inset-8'
+          isFullscreen ? 'inset-1' : 'inset-2 sm:inset-4 md:inset-8'
         )}>
-          {/* Page spread container */}
+          {/* Page spread container with zoom */}
           <div
+            ref={pageContainerRef}
             className={cn(
-              'relative flex gap-1 md:gap-2 h-full max-h-[85vh] transition-transform duration-300',
+              'relative flex gap-0.5 sm:gap-1 md:gap-2 h-full max-w-full transition-transform duration-300',
+              isSinglePage ? 'max-h-full' : 'max-h-[85vh]',
               flipDirection === 'left' && 'animate-flip-left',
               flipDirection === 'right' && 'animate-flip-right'
             )}
             style={{
               aspectRatio: isSinglePage ? '3/4' : '4/3',
-              perspective: '2000px'
+              perspective: '2000px',
+              transform: zoomScale > 1 ? `scale(${zoomScale})` : undefined,
+              transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%`,
+              transition: zoomScale === 1 ? 'transform 0.3s ease' : undefined
             }}
           >
             {currentPages.map((page, index) => {
@@ -518,10 +706,10 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                     shouldPreload={false}
                     isMuted={audioFocusPageId !== page.id}
                     onAudioFocus={() => handlePageAudioFocus(page.id)}
-                    onVideoEnded={isAutoPlay ? handleVideoEnded : undefined}
-                    onVideoProgress={handleVideoProgress}
+                    onVideoEnded={isAutoPlay && index === autoPlaySlot ? handleVideoEnded : undefined}
+                    onVideoProgress={index === autoPlaySlot ? handleVideoProgress : undefined}
                     onToggleMotion={() => setIsVideoMode(false)}
-                    autoPlayActive={isAutoPlay}
+                    autoPlayActive={isAutoPlay && index === autoPlaySlot}
                     className={cn(
                       !isSinglePage && index === 0 && 'rounded-r-none',
                       !isSinglePage && index === 1 && 'rounded-l-none'
@@ -556,15 +744,17 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
           })}
         </div>
 
-        {/* Navigation buttons */}
+        {/* Navigation arrows — auto-hide with chrome */}
         <button
-          onClick={goToPrevPage}
+          onClick={(e) => { e.stopPropagation(); goToPrevPage() }}
           disabled={currentPage === 0}
           className={cn(
-            'absolute left-2 md:left-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full',
+            'absolute left-2 md:left-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
             'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
             'text-foreground hover:bg-card hover:scale-110 transition-all',
-            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100'
+            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
+            chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
+            'transition-opacity duration-500'
           )}
           aria-label="Previous page"
         >
@@ -572,30 +762,45 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
         </button>
 
         <button
-          onClick={goToNextPage}
+          onClick={(e) => { e.stopPropagation(); goToNextPage() }}
           disabled={currentPage >= maxPage}
           className={cn(
-            'absolute right-2 md:right-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full',
+            'absolute right-2 md:right-4 top-1/2 -translate-y-1/2 p-2 md:p-3 rounded-full z-20',
             'bg-card/80 backdrop-blur-sm border border-border shadow-lg',
             'text-foreground hover:bg-card hover:scale-110 transition-all',
-            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100'
+            'disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100',
+            chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
+            'transition-opacity duration-500'
           )}
           aria-label="Next page"
         >
           <ChevronRight className="w-5 h-5 md:w-6 md:h-6" />
         </button>
 
-        {/* Page indicator — hidden in fullscreen */}
+        {/* Page indicator — auto-hide with chrome, hidden in fullscreen */}
         {!isFullscreen && (
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3 px-4 py-2 rounded-full bg-card/80 backdrop-blur-sm border border-border">
-            <span className="text-sm text-foreground font-medium">
+          <div
+            className={cn(
+              'absolute bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1 sm:px-4 sm:py-2 rounded-full bg-card/80 backdrop-blur-sm border border-border z-20',
+              'transition-opacity duration-500',
+              chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
+            )}
+          >
+            <span className="text-xs sm:text-sm text-foreground font-medium">
               {currentPage + 1}{currentPages.length > 1 ? `–${currentPage + currentPages.length}` : ''} / {pages.length}
             </span>
           </div>
         )}
+
+        {/* Zoom indicator */}
+        {zoomScale > 1 && (
+          <div className="absolute top-4 left-4 px-2.5 py-1 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-foreground z-20">
+            {Math.round(zoomScale * 100)}%
+          </div>
+        )}
       </main>
 
-      {/* Segmented progress bar — one segment per page */}
+      {/* Segmented progress bar — always visible */}
       <div className="flex h-1.5 bg-muted gap-px">
         {pages.map((page, index) => {
           const isPast = index < currentPage
@@ -623,19 +828,20 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
                 />
               )}
               {hasVideoIndicator && (
-                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-primary-foreground/60" />
+                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-red-500" />
               )}
             </button>
           )
         })}
       </div>
 
-      {/* Collapsible thumbnail panel — hidden in fullscreen */}
+      {/* Collapsible thumbnail panel — hidden in fullscreen, auto-hide with chrome */}
       {!isFullscreen && (
         <div
           className={cn(
             'border-t border-border bg-card/95 backdrop-blur-sm transition-all duration-300 overflow-hidden',
-            showThumbnailPanel ? 'max-h-[160px]' : 'max-h-8'
+            showThumbnailPanel ? 'max-h-[160px]' : 'max-h-8',
+            !chromeVisible && !showThumbnailPanel ? 'max-h-0 border-t-0' : ''
           )}
         >
           {/* Toggle bar */}
@@ -694,7 +900,11 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
       <Dialog open={showShortcuts} onOpenChange={setShowShortcuts}>
         <DialogTrigger asChild>
           <button
-            className="absolute bottom-6 right-4 hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-colors shadow-sm"
+            className={cn(
+              'absolute bottom-6 right-4 hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-card/80 backdrop-blur-sm border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-muted/80 transition-all shadow-sm z-20',
+              chromeVisible ? 'opacity-100' : 'opacity-0 pointer-events-none',
+              'duration-500'
+            )}
             title="Keyboard shortcuts (?)"
           >
             <Keyboard className="w-3.5 h-3.5" />
@@ -727,6 +937,9 @@ export function ComicViewer({ volume = 'vol1', episode = 'ep2' }: ComicViewerPro
               </div>
             ))}
           </div>
+          <p className="text-xs text-muted-foreground mt-2">
+            Tap left/right edges to navigate · Center tap to show/hide UI · Double-tap to zoom · Pinch to zoom on mobile
+          </p>
         </DialogContent>
       </Dialog>
     </div>

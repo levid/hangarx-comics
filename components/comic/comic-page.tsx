@@ -153,7 +153,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               src={page.image}
               alt={page.title || `Page ${page.id}`}
               fill
-              className="object-cover"
+              className="object-contain md:object-cover"
               priority
             />
             {/* Video overlay */}
@@ -165,11 +165,11 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               loop={!autoPlayActive}
               playsInline
               preload={isActive || shouldPreload ? 'auto' : 'none'}
-              className="absolute inset-0 w-full h-full object-cover z-[1]"
+              className="absolute inset-0 w-full h-full object-contain md:object-cover z-[1]"
             />
             {/* Audio state indicator */}
             <button
-              className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1.5 rounded-full bg-background/70 backdrop-blur-sm text-foreground text-xs z-[2] hover:bg-background/90 transition-colors"
+              className="absolute top-2 right-2 sm:top-4 sm:right-4 flex items-center gap-1 sm:gap-1.5 px-2 py-1 sm:px-2.5 sm:py-1.5 rounded-full bg-background/70 backdrop-blur-sm text-foreground text-[10px] sm:text-xs z-[2] hover:bg-background/90 transition-colors"
               onClick={(e) => { e.stopPropagation(); onAudioFocus?.() }}
               aria-label={isMuted ? 'Unmute' : 'Mute'}
             >
@@ -179,14 +179,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
                 <><Volume2 className="w-3.5 h-3.5 text-primary" /><span>Playing</span></>
               )}
             </button>
-            {/* Motion mode badge — click to switch to static */}
-            <button
-              onClick={(e) => { e.stopPropagation(); onToggleMotion?.() }}
-              className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full bg-primary/90 text-primary-foreground text-sm z-[2] cursor-pointer hover:bg-primary transition-colors"
-            >
-              <Play className="w-4 h-4 fill-current" />
-              <span>Motion</span>
-            </button>
+
           </div>
         ) : shouldPreload && hasVideo ? (
           /* Preload-only: render offscreen video for caching + show the static image */
@@ -196,7 +189,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               alt={page.title || `Page ${page.id}`}
               fill
               className={cn(
-                'object-cover transition-opacity duration-500',
+                'object-contain md:object-cover transition-opacity duration-500',
                 isImageLoaded ? 'opacity-100' : 'opacity-0'
               )}
               onLoad={() => setIsImageLoaded(true)}
@@ -223,7 +216,7 @@ export function ComicPage({ page, isVideoMode, isActive, shouldPreload, isMuted 
               alt={page.title || `Page ${page.id}`}
               fill
               className={cn(
-                'object-cover transition-opacity duration-500',
+                'object-contain md:object-cover transition-opacity duration-500',
                 isImageLoaded ? 'opacity-100' : 'opacity-0'
               )}
               onLoad={() => setIsImageLoaded(true)}
